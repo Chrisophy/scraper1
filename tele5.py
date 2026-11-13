@@ -25,7 +25,7 @@ try:
 except Exception:
     htmlscrape = None
 
-SITE_ID       = "tele5b"
+SITE_ID       = "tele5"
 SITE_NAME     = "TELE 5"
 SITE_DOMAIN   = "tele5.de"
 TYPE          = "both"
