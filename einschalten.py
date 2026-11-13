@@ -25,7 +25,7 @@ try:
 except Exception:
     htmlscrape = None
 
-SITE_ID       = "einschaltenbk"
+SITE_ID       = "einschalten"
 SITE_NAME     = "Einschalten"
 SITE_DOMAIN   = "einschalten.in"
 TYPE          = "both"
