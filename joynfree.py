@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 # JoynFree
-# IT('s) Possible 
-# 2026.11.07
+# zusatzmetall | IT('s) Possible
+# 2026.11.19
+import base64
 import hashlib
 import json
 import re
+import threading
 import time
 import uuid
 
@@ -94,8 +96,12 @@ _FREE_LT   = {'AVOD', 'FVOD'}
 _PAGE_SIZE = 48
 _GQL_FIRST = 1000
 
-_TCACHE    = {}
-_DEVICE_ID = None
+_TCACHE        = {}
+_DEVICE_ID     = None
+_LOCK          = threading.RLock()
+_TOKEN_MARGIN  = 120
+_AUTH_HINTS    = ('unauthor', 'unauthenticated', 'expired', 'jwt',
+                  'invalid token', 'invalid_token', 'forbidden', 'not authorized')
 
 
 def _device_id():
@@ -103,6 +109,10 @@ def _device_id():
     if _DEVICE_ID is None:
         _DEVICE_ID = str(uuid.uuid4())
     return _DEVICE_ID
+
+
+def _client_id():
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, 'JOYNCLIENTID' + _device_id()))
 
 
 def _base_hdr():
@@ -139,9 +149,19 @@ def _post_json(url, payload, headers=None, timeout=15):
         return '', 0
 
 
+def _jwt_exp(token):
+    try:
+        part = token.split('.')[1]
+        part += '=' * (-len(part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part.encode('ascii')).decode('utf-8'))
+        return float(payload.get('exp') or 0)
+    except Exception:
+        return 0.0
+
+
 def _anon_token():
     did = _device_id()
-    cid = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'JOYNCLIENTID' + did))
+    cid = _client_id()
     h   = {**_base_hdr(), 'Joyn-Country': _COUNTRY, 'Joyn-Distribution-Tenant': _TENANT}
     body, st = _post_json(_AUTH_URL,
                           {'anon_device_id': did, 'client_id': cid, 'client_name': 'web'}, h)
@@ -167,33 +187,64 @@ def _refresh(refresh_tok, client_id):
         return {}
 
 
-def _token():
-    _detect_country()
+def _store_token(data, old=None):
     now = time.time()
-    tok = _TCACHE.get('data', {})
-    if tok and _TCACHE.get('exp', 0) > now + 300:
-        log.log('[Joyn] _token: cache hit (exp in %.0fs)' % (_TCACHE['exp'] - now))
-        return tok.get('access_token', '')
-    if tok.get('refresh_token') and _TCACHE.get('cid'):
-        log.log('[Joyn] _token: refreshing …')
-        r = _refresh(tok['refresh_token'], _TCACHE['cid'])
-        if r.get('access_token'):
-            _TCACHE['data'] = r
-            _TCACHE['exp']  = now + r.get('expires_in', 3600) - 300
-            log.log('[Joyn] _token: refresh OK, exp_in=%s' % r.get('expires_in'))
-            return r['access_token']
-        log.log('[Joyn] _token: refresh failed, falling back to anon', log.LOGWARNING)
-    log.log('[Joyn] _token: fetching anon token …')
-    fresh = _anon_token()
-    if fresh.get('access_token'):
-        _TCACHE['data'] = fresh
-        _TCACHE['exp']  = now + fresh.get('expires_in', 3600) - 300
-        _TCACHE['cid']  = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'JOYNCLIENTID' + _device_id()))
-        log.log('[Joyn] _token: anon OK, exp_in=%s' % fresh.get('expires_in'))
-    else:
+    candidates = []
+    try:
+        life = int(data.get('expires_in') or 0)
+    except Exception:
+        life = 0
+    if life > 0:
+        candidates.append(now + life)
+    jwt_exp = _jwt_exp(data.get('access_token', ''))
+    if jwt_exp > now:
+        candidates.append(jwt_exp)
+    exp = min(candidates) if candidates else now + 3600
+    margin = min(_TOKEN_MARGIN, max(0.0, (exp - now) / 2.0))
+    if old and not data.get('refresh_token') and old.get('refresh_token'):
+        data['refresh_token'] = old['refresh_token']
+    _TCACHE['data'] = data
+    _TCACHE['exp']  = exp - margin
+    _TCACHE['cid']  = _client_id()
+    log.log('[Joyn] _store_token: gültig noch %.0fs' % (_TCACHE['exp'] - now))
+
+
+def _invalidate_token():
+    with _LOCK:
+        _TCACHE['exp'] = 0
+
+
+def _reset_identity():
+    global _DEVICE_ID
+    with _LOCK:
+        _TCACHE.clear()
+        _DEVICE_ID = None
+
+
+def _token(force=False):
+    _detect_country()
+    with _LOCK:
+        now = time.time()
+        tok = _TCACHE.get('data') or {}
+        if not force and tok.get('access_token') and _TCACHE.get('exp', 0) > now:
+            return tok['access_token']
+        if tok.get('refresh_token') and _TCACHE.get('cid'):
+            log.log('[Joyn] _token: refreshing …')
+            r = _refresh(tok['refresh_token'], _TCACHE['cid'])
+            if r.get('access_token'):
+                _store_token(r, tok)
+                log.log('[Joyn] _token: refresh OK')
+                return r['access_token']
+            log.log('[Joyn] _token: refresh failed, falling back to anon', log.LOGWARNING)
+        log.log('[Joyn] _token: fetching anon token …')
+        fresh = _anon_token()
+        if fresh.get('access_token'):
+            _store_token(fresh)
+            log.log('[Joyn] _token: anon OK')
+            return fresh['access_token']
         log.log('[Joyn] _token: Kein access_token! response=%s' % str(fresh)[:200],
                 log.LOGWARNING)
-    return fresh.get('access_token', '')
+        return ''
 
 
 def _gql_hdr():
@@ -213,6 +264,63 @@ def _gql_hdr():
     }
 
 
+def _http_status(e):
+    code = getattr(e, 'code', None)
+    if isinstance(code, int):
+        return code
+    resp = getattr(e, 'response', None)
+    code = getattr(resp, 'status_code', None)
+    return code if isinstance(code, int) else 0
+
+
+def _is_auth_error(data):
+    if not isinstance(data, dict) or not data.get('errors'):
+        return False
+    txt = str(data['errors']).lower()
+    return any(k in txt for k in _AUTH_HINTS)
+
+
+def _gql_send(op, params=None, payload=None):
+    for attempt in range(3):
+        status = 0
+        data   = None
+        try:
+            if payload is None:
+                r = multiquest.get(_GQL_URL, headers=_gql_hdr(), params=params, timeout=15)
+            else:
+                r = multiquest.post(_GQL_URL, json=payload, headers=_gql_hdr(), timeout=15)
+            status = r.status_code
+        except Exception as e:
+            status = _http_status(e)
+            log.log('[Joyn] GQL exception %s: %s' % (op, e), log.LOGWARNING)
+            if status not in (401, 403):
+                return None
+        else:
+            log.log('[Joyn] GQL %s HTTP %d' % (op, status))
+            try:
+                data = json.loads(r.text)
+            except Exception:
+                data = None
+
+        usable = isinstance(data, dict) and data.get('data')
+        if (status in (401, 403) or (not usable and _is_auth_error(data))) and attempt < 2:
+            log.log('[Joyn] GQL %s: Token abgelehnt (HTTP %s), erneuere Sitzung (Versuch %d)'
+                    % (op, status, attempt + 1), log.LOGWARNING)
+            if attempt == 0:
+                _invalidate_token()
+            else:
+                _reset_identity()
+            continue
+
+        if isinstance(data, dict):
+            if 'data' in data:
+                return data['data']
+            if 'errors' in data:
+                log.log('[Joyn] GQL errors: %s' % str(data['errors'])[:200], log.LOGWARNING)
+        return None
+    return None
+
+
 def _gql(op, variables, hash_key, extra=None):
     params = {
         'operationName': op,
@@ -224,30 +332,11 @@ def _gql(op, variables, hash_key, extra=None):
     if extra:
         params.update(extra)
     log.log('[Joyn] GQL %s %s' % (op, str(variables)[:100]))
-    try:
-        r    = multiquest.get(_GQL_URL, headers=_gql_hdr(), params=params, timeout=15)
-        data = json.loads(r.text)
-        log.log('[Joyn] GQL %s HTTP %d' % (op, r.status_code))
-        if isinstance(data, dict) and 'data' in data:
-            return data['data']
-        if isinstance(data, dict) and 'errors' in data:
-            log.log('[Joyn] GQL errors: %s' % str(data['errors'])[:200], log.LOGWARNING)
-    except Exception as e:
-        log.log('[Joyn] GQL exception %s: %s' % (op, e), log.LOGWARNING)
-    return None
+    return _gql_send(op, params=params)
 
 
 def _gql_raw(op, query):
-    try:
-        r    = multiquest.post(_GQL_URL,
-                               json={'query': 'query %s %s' % (op, query), 'operationName': op},
-                               headers=_gql_hdr(), timeout=15)
-        data = json.loads(r.text)
-        if isinstance(data, dict) and 'data' in data:
-            return data['data']
-    except Exception as e:
-        log.log('[Joyn] GQL raw exception %s: %s' % (op, e), log.LOGWARNING)
-    return None
+    return _gql_send(op, payload={'query': 'query %s %s' % (op, query), 'operationName': op})
 
 
 def _is_free(asset):
@@ -286,8 +375,8 @@ def _detect_fsk_from_node(m):
         if '16' in val:
             return 'FSK ab 16 – erst ab 22 Uhr'
     full_text = (
-        str(m.get('description', '')) + ' ' + 
-        str(m.get('title', '')) + ' ' + 
+        str(m.get('description', '')) + ' ' +
+        str(m.get('title', '')) + ' ' +
         str(m.get('secondaryTitle', ''))
     ).lower()
     if 'ab 18' in full_text or 'fsk 18' in full_text or 'jugendfrei ab 18' in full_text:
@@ -301,7 +390,7 @@ def _build_movie(m):
     vid  = (m.get('video') or {}).get('id', '')
     path = m.get('path', '')
     url  = ('vod:%s' % vid) if vid else ('movie:%s' % path)
-    
+
     fsk = _detect_fsk_from_node(m)
     if fsk and vid:
         _FSK_MAP[vid] = fsk
@@ -560,7 +649,7 @@ def showEntries(url='', params=None):
         return _load_block(block_id, offset)
 
     if base_url.startswith('channel:'):
-        path = base_url[8:] 
+        path = base_url[8:]
         return _load_channel_content(path, offset)
 
     if base_url.startswith('compilation:'):
@@ -581,7 +670,7 @@ def _load_all_movies(offset=0):
     page = (cat_data or {}).get('page') or {}
     blocks = list(page.get('blocks') or []) + list(page.get('lazyBlocks') or [])
     block_ids = [block.get('id') for block in blocks if isinstance(block, dict) and block.get('__typename') in _CATEGORY_LANES and block.get('id')]
-    
+
     if block_ids:
         b_data = _gql('LandingBlocks', {'ids': block_ids}, 'LANDINGBLOCKS', {'enable_user_location': 'true'})
         for item in _extract(b_data):
@@ -856,17 +945,9 @@ def get_live(url='', params=None):
 
 
 def _build_sig(client_data_json, ent_token):
-    import base64
     sig_key   = base64.b64decode(_SIG_KEY).decode('utf-8')
     sha_input = '%s,%s%s' % (client_data_json, ent_token, sig_key)
     return hashlib.sha1(sha_input.encode('utf-8')).hexdigest()
-
-
-def _reset_identity():
-    """Neue anonyme Sitzung: Token-Cache leeren und neue Geräte-ID erzeugen."""
-    global _DEVICE_ID
-    _TCACHE.clear()
-    _DEVICE_ID = None
 
 
 def _get_ent(video_id, stream_type, _retry=True):
@@ -885,14 +966,12 @@ def _get_ent(video_id, stream_type, _retry=True):
     if not body or st >= 400:
         log.log('[Joyn] _get_ent FAILED HTTP %d body=%s' % (st, body[:300]), log.LOGWARNING)
         low = body.lower()
-        # Jugendschutz (FSK): nur bei eindeutigen Meldungen, nicht bei jedem Text mit "age"/"16"/"18"
         if 'ageverification' in low or 'age_verification' in low or 'fsk' in low or 'jugendschutz' in low:
             fsk_text = _FSK_MAP.get(video_id)
             if not fsk_text:
                 fsk_text = 'FSK ab 18 – erst ab 0 Uhr' if '18' in body else 'FSK ab 16 – erst ab 22 Uhr'
             log.log('[Joyn] Jugendschutz greift: %s' % fsk_text, log.LOGERROR)
             raise Exception(fsk_text)
-        # Zugriff verweigert / Sitzung abgelehnt: einmal mit frischer anonymer Sitzung erneut versuchen
         if _retry and (st in (401, 403) or 'playback_restricted' in low or 'ent_' in low):
             log.log('[Joyn] _get_ent: neue anonyme Sitzung, zweiter Versuch', log.LOGWARNING)
             _reset_identity()
@@ -918,7 +997,6 @@ def _get_ent(video_id, stream_type, _retry=True):
 
 
 def _get_mpd(video_id, stream_type, ent_tok):
-    import base64
     log.log('[Joyn] _get_mpd video_id=%s type=%s' % (video_id, stream_type))
     client_data = json.dumps({
         'manufacturer': 'unknown', 'platform': 'browser',
